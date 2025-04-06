@@ -119,13 +119,15 @@ def main(argv: list[str]) -> None:
     if args.config is None:
         raise AttributeError("Please specify a model configuration.")
     config = resolve_config(args.config)
-    config.update(parse_model_config_opts(args.D))
+    if args.D is not None:
+        config.update(parse_model_config_opts(args.D))
     config.validate()
 
     if not args.name:
         args.name = config.name
 
     num_gpu = get_num_devices() if args.devices is None else args.devices
+    print(get_num_devices(), args.devices)
     assert num_gpu <= get_num_devices()
 
     if args.cache is not None:

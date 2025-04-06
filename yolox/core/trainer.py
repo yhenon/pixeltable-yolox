@@ -97,15 +97,17 @@ class Trainer:
         iter_start_time = time.time()
 
         inps, targets = self.prefetcher.next()
+
         inps = inps.to(self.data_type)
         targets = targets.to(self.data_type)
         targets.requires_grad = False
         inps, targets = self.exp.preprocess(inps, targets, self.input_size)
         data_end_time = time.time()
+        # from yolox.data.datasets.coco_vis import visualize_output
+        # visualize_output(inps[0,:,:,:], targets[0,:,:])
 
         with torch.cuda.amp.autocast(enabled=self.amp_training):
             outputs = self.model(inps, targets)
-
         loss = outputs["total_loss"]
 
         self.optimizer.zero_grad()
@@ -139,6 +141,9 @@ class Trainer:
             "Model Summary: {}".format(get_model_info(model, self.exp.test_size))
         )
         model.to(self.device)
+        path = 'latest_ckpt.pth'
+        weights = torch.load(path, map_location=torch.device('cpu'))
+        model.load_state_dict(weights['model'])
 
         # solver related init
         self.optimizer = self.exp.get_optimizer(self.args.batch_size)
@@ -194,7 +199,7 @@ class Trainer:
                 raise ValueError("logger must be either 'tensorboard', 'mlflow' or 'wandb'")
 
         logger.info("Training start...")
-        logger.info("\n{}".format(model))
+        #logger.info("\n{}".format(model))
 
     def after_train(self):
         logger.info(
@@ -235,7 +240,7 @@ class Trainer:
         if (self.epoch + 1) % self.exp.eval_interval == 0:
             all_reduce_norm(self.model)
             self.evaluate_and_save_model()
-
+            
     def before_iter(self):
         pass
 
@@ -351,7 +356,6 @@ class Trainer:
             evalmodel = self.model
             if is_parallel(evalmodel):
                 evalmodel = evalmodel.module
-
         with adjust_status(evalmodel, training=False):
             (ap50_95, ap50, summary), predictions = self.exp.eval(
                 evalmodel, self.evaluator, self.is_distributed, return_outputs=True
