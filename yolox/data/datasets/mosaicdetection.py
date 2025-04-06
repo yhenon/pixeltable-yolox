@@ -5,7 +5,7 @@ import random
 import cv2
 import numpy as np
 
-from yolox.utils import adjust_box_anns, get_local_rank
+from yolox.utils import adjust_box_anns, adjust_kpts_anns, get_local_rank
 
 from ..data_augment import random_affine
 from .datasets_wrapper import Dataset
@@ -114,6 +114,15 @@ class MosaicDetection(Dataset):
                     labels[:, 1] = scale * _labels[:, 1] + padh
                     labels[:, 2] = scale * _labels[:, 2] + padw
                     labels[:, 3] = scale * _labels[:, 3] + padh
+
+                    # --- Keypoint transformation  ---
+                    if labels.shape[1] > 5: # Check if keypoints exist
+                        # Apply scale and padding to x coordinates (indices 5, 8, 11, ...)
+                        labels[:, 5::3] = scale * labels[:, 5::3] + padw
+                        # Apply scale and padding to y coordinates (indices 6, 9, 12, ...)
+                        labels[:, 6::3] = scale * labels[:, 6::3] + padh
+                        # Visibility (indices 7, 10, 13, ...) remains unchanged here
+
                 mosaic_labels.append(labels)
 
             if len(mosaic_labels):
@@ -122,6 +131,12 @@ class MosaicDetection(Dataset):
                 np.clip(mosaic_labels[:, 1], 0, 2 * input_h, out=mosaic_labels[:, 1])
                 np.clip(mosaic_labels[:, 2], 0, 2 * input_w, out=mosaic_labels[:, 2])
                 np.clip(mosaic_labels[:, 3], 0, 2 * input_h, out=mosaic_labels[:, 3])
+
+                # --- Keypoint Clipping  ---
+                if mosaic_labels.shape[1] > 5: # Check if keypoints exist
+                    np.clip(mosaic_labels[:, 5::3], 0, 2 * input_w, out=mosaic_labels[:, 5::3]) # Clip x coords
+                    np.clip(mosaic_labels[:, 6::3], 0, 2 * input_h, out=mosaic_labels[:, 6::3]) # Clip y coords
+                    # Visibility remains unchanged here
 
             mosaic_img, mosaic_labels = random_affine(
                 mosaic_img,
@@ -159,7 +174,8 @@ class MosaicDetection(Dataset):
 
     def mixup(self, origin_img, origin_labels, input_dim):
         jit_factor = random.uniform(*self.mixup_scale)
-        FLIP = random.uniform(0, 1) > 0.5
+        # TODO: HANDLE FLIP FOR KPTS accounting for left<->right switches
+        FLIP = False # random.uniform(0, 1) > 0.5
         cp_labels = []
         while len(cp_labels) == 0:
             cp_index = random.randint(0, self.__len__() - 1)
@@ -210,10 +226,12 @@ class MosaicDetection(Dataset):
         cp_bboxes_origin_np = adjust_box_anns(
             cp_labels[:, :4].copy(), cp_scale_ratio, 0, 0, origin_w, origin_h
         )
+
         if FLIP:
             cp_bboxes_origin_np[:, 0::2] = (
                 origin_w - cp_bboxes_origin_np[:, 0::2][:, ::-1]
             )
+
         cp_bboxes_transformed_np = cp_bboxes_origin_np.copy()
         cp_bboxes_transformed_np[:, 0::2] = np.clip(
             cp_bboxes_transformed_np[:, 0::2] - x_offset, 0, target_w
@@ -222,9 +240,49 @@ class MosaicDetection(Dataset):
             cp_bboxes_transformed_np[:, 1::2] - y_offset, 0, target_h
         )
 
+        # Process keypoints if present
+        if cp_labels.shape[1] > 5:
+            # Extract keypoints
+            cp_keypoints = cp_labels[:, 5:].copy()
+            
+            # Reshape for easier processing
+            num_keypoints = (cp_labels.shape[1] - 5) // 3
+            keypoints = cp_keypoints.reshape(cp_labels.shape[0], num_keypoints, 3)
+            
+            # Apply scale
+            keypoints[:, :, 0] *= cp_scale_ratio  # x
+            keypoints[:, :, 1] *= cp_scale_ratio  # y
+            
+            # Apply flip if needed
+            if FLIP:
+                # Flip x-coordinates: width - x
+                keypoints[:, :, 0] = origin_w - keypoints[:, :, 0]
+                
+                # Additionally, swap left-right keypoint pairs if using a standard keypoint format
+                # This depends on your specific keypoint ordering (e.g., COCO has specific left-right pairs)
+                # Example for COCO (simplified):
+                # COCO keypoint pairs: [[1,2], [3,4], [5,6], [7,8], [9,10], [11,12], [13,14], [15,16]]
+                # if using COCO format:
+                #     for l, r in [[1,2], [3,4], [5,6], [7,8], [9,10], [11,12], [13,14], [15,16]]:
+                #         keypoints[:, [l-1, r-1], :] = keypoints[:, [r-1, l-1], :]  # Swap left-right pairs
+            
+            # Apply offset and clip
+            keypoints[:, :, 0] = np.clip(keypoints[:, :, 0] - x_offset, 0, target_w)  # x
+            keypoints[:, :, 1] = np.clip(keypoints[:, :, 1] - y_offset, 0, target_h)  # y
+            
+            # Reshape back to original format
+            cp_labels[:, 5:] = keypoints.reshape(cp_labels.shape[0], -1)
+
         cls_labels = cp_labels[:, 4:5].copy()
-        box_labels = cp_bboxes_transformed_np
-        labels = np.hstack((box_labels, cls_labels))
+
+        # For keypoints, we need to include all columns from 5 onwards
+        if cp_labels.shape[1] > 5:
+            keypoint_labels = cp_labels[:, 5:].copy()
+            # Combine bboxes, class labels, and keypoints
+            labels = np.hstack((cp_bboxes_transformed_np, cls_labels, keypoint_labels))
+        else:
+            # Just bboxes and class labels (no keypoints)
+            labels = np.hstack((cp_bboxes_transformed_np, cls_labels))
         origin_labels = np.vstack((origin_labels, labels))
         origin_img = origin_img.astype(np.float32)
         origin_img = 0.5 * origin_img + 0.5 * padded_cropped_img.astype(np.float32)

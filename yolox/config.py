@@ -33,7 +33,6 @@ class YoloxConfig:
     seed: Optional[Any] = None
     output_dir: str = "./out"
     print_interval: int = 100
-    eval_interval: int = 10
 
     # ---------------- dataloader config ---------------- #
     # deterministic data loading
@@ -78,7 +77,7 @@ class YoloxConfig:
 
     # --------------  training config --------------------- #
     # epoch number used for warmup
-    warmup_epochs: int = 5
+    warmup_epochs: int = 0 #  5
     # max training epoch
     max_epoch: int = 300
     # minimum learning rate during warmup
@@ -86,6 +85,7 @@ class YoloxConfig:
     min_lr_ratio: float = 0.05
     # learning rate for one image. During training, lr will multiply batchsize.
     basic_lr_per_img: float = 0.01 / 64.0
+    basic_lr_per_img: float = 0.001 / 64.0
     # name of LRScheduler
     scheduler: str = "yoloxwarmcos"
     # last #epoch to close augmention like mosaic
@@ -102,7 +102,7 @@ class YoloxConfig:
     print_interval: int = 10
     # eval period in epoch, for example,
     # if set to 1, model will be evaluate after every epoch.
-    eval_interval: int = 10
+    eval_interval: int = 1
     # save history checkpoint or not.
     # If set to False, yolox will only save latest and best ckpt.
     save_history_ckpt: bool = True
@@ -116,6 +116,8 @@ class YoloxConfig:
     # nms threshold
     nmsthre: float = 0.65
 
+    # keypoint model#
+    pose = False
     dataset: Optional[Dataset] = None
 
     @classmethod
@@ -300,8 +302,13 @@ class YoloxConfig:
             inputs = nn.functional.interpolate(
                 inputs, size=tsize, mode="bilinear", align_corners=False
             )
-            targets[..., 1::2] = targets[..., 1::2] * scale_x
-            targets[..., 2::2] = targets[..., 2::2] * scale_y
+            targets[..., 1] = targets[..., 1] * scale_x
+            targets[..., 3] = targets[..., 3] * scale_x
+            targets[..., 2] = targets[..., 2] * scale_y
+            targets[..., 4] = targets[..., 4] * scale_y
+            if targets.shape[2] > 5:
+                targets[..., 5::3] = targets[..., 5::3] * scale_x
+                targets[..., 6::3] = targets[..., 6::3] * scale_y
         return inputs, targets
 
     def get_optimizer(self, batch_size):
@@ -321,9 +328,11 @@ class YoloxConfig:
                 elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
                     pg1.append(v.weight)  # apply decay
 
-            optimizer = torch.optim.SGD(
-                pg0, lr=lr, momentum=self.momentum, nesterov=True
-            )
+            #optimizer = torch.optim.SGD(
+            #    pg0, lr=lr, momentum=self.momentum, nesterov=True
+            #)
+            optimizer = torch.optim.AdamW(
+                pg0, lr=lr)
             optimizer.add_param_group(
                 {"params": pg1, "weight_decay": self.weight_decay}
             )  # add pg1 with weight_decay
@@ -463,7 +472,163 @@ class YoloxNano(YoloxConfig):
         self.enable_mixup = False
 
 
+class YoloxPose(YoloxConfig):
+    def __init__(self):
+        super().__init__("yolox_pose")
+        self.depth = 0.33
+        self.width = 0.25
+        self.depthwise = True
+        self.input_size = (416, 416)
+        self.random_size = (10, 20)
+        self.mosaic_scale = (0.5, 1.5)
+        self.test_size = (416, 416)
+        self.mosaic_prob = 0.0
+        self.enable_mixup = False
+        self.num_classes = 1
+        self.max_epoch = 300
+        self.num_keypoints = 17
+        self.coco_flip_map = [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)]
+
+        self.pose = True
+        # name of annotation file for training
+        self.train_ann: str = "person_keypoints_train2017.json"
+        # name of annotation file for evaluation
+        self.val_ann: str = "person_keypoints_val2017.json"
+
+    def get_data_loader(self, batch_size, is_distributed, no_aug=False, cache_img: str = None):
+        """
+        Get dataloader according to cache_img parameter.
+        Args:
+            no_aug (bool, optional): Whether to turn off mosaic data enhancement. Defaults to False.
+            cache_img (str, optional): cache_img is equivalent to cache_type. Defaults to None.
+                "ram" : Caching imgs to ram for fast training.
+                "disk": Caching imgs to disk for fast training.
+                None: Do not use cache, in this case cache_data is also None.
+        """
+        from yolox.data import (
+            DataLoader,
+            InfiniteSampler,
+            MosaicDetection,
+            TrainTransformPose,
+            YoloBatchSampler,
+            worker_init_reset_seed
+        )
+        from yolox.utils import wait_for_the_master
+
+        # if cache is True, we will create self.dataset before launch
+        # else we will create self.dataset after launch
+        if self.dataset is None:
+            with wait_for_the_master():
+                assert cache_img is None, \
+                    "cache_img must be None if you didn't create self.dataset before launch"
+                self.dataset = self.get_dataset(cache=False, cache_type=cache_img)
+
+        self.dataset = MosaicDetection(
+            dataset=self.dataset,
+            mosaic=not no_aug,
+            img_size=self.input_size,
+            preproc=TrainTransformPose(
+                max_labels=120,
+                flip_prob=self.flip_prob,
+                hsv_prob=self.hsv_prob, 
+                keypoint_flip_indices=self.coco_flip_map),
+            degrees=self.degrees,
+            translate=self.translate,
+            mosaic_scale=self.mosaic_scale,
+            mixup_scale=self.mixup_scale,
+            shear=self.shear,
+            enable_mixup=self.enable_mixup,
+            mosaic_prob=self.mosaic_prob,
+            mixup_prob=self.mixup_prob,
+        )
+
+        if is_distributed:
+            batch_size = batch_size // dist.get_world_size()
+
+        sampler = InfiniteSampler(len(self.dataset), seed=self.seed if self.seed else 0)
+
+        batch_sampler = YoloBatchSampler(
+            sampler=sampler,
+            batch_size=batch_size,
+            drop_last=False,
+            mosaic=not no_aug,
+        )
+
+        # Make sure each process has different random seed, especially for 'fork' method.
+        # Check https://github.com/pytorch/pytorch/issues/63311 for more details.
+        worker_init_fn = None if self.deterministic else worker_init_reset_seed
+
+        train_loader = DataLoader(
+            self.dataset,
+            num_workers=self.data_num_workers,
+            pin_memory=True,
+            batch_sampler=batch_sampler,
+            worker_init_fn=worker_init_fn
+        )
+
+        return train_loader
+
+    def get_dataset(self, cache: bool = False, cache_type: str = "ram"):
+        """
+        Get dataset according to cache and cache_type parameters.
+        Args:
+            cache (bool): Whether to cache imgs to ram or disk.
+            cache_type (str, optional): Defaults to "ram".
+                "ram" : Caching imgs to ram for fast training.
+                "disk": Caching imgs to disk for fast training.
+        """
+        from yolox.data import CocoKeypointDataset, TrainTransformPose
+        dataset = CocoKeypointDataset(
+            data_dir=self.data_dir,
+            json_file=self.train_ann,
+            img_size=self.input_size,
+            preproc=TrainTransformPose(
+                max_labels=50,
+                flip_prob=self.flip_prob,
+                hsv_prob=self.hsv_prob,
+                keypoint_flip_indices=self.coco_flip_map
+            ),
+            cache=cache,
+            cache_type=cache_type,
+        )
+        return dataset
+    def get_model(self):
+        from yolox.models import YoloPafpn, Yolox, YoloxPoseHead
+
+        def init_yolo(M):
+            for m in M.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eps = 1e-3
+                    m.momentum = 0.03
+
+        if getattr(self, "model", None) is None:
+            in_channels = [256, 512, 1024]
+            backbone = YoloPafpn(self.depth, self.width, in_channels=in_channels, depthwise=self.depthwise, act=self.act)
+            head = YoloxPoseHead(17, self.width, in_channels=in_channels, depthwise=self.depthwise, act=self.act)
+            self.model = Yolox(backbone, head)
+
+        self.model.apply(init_yolo)
+        self.model.head.initialize_biases(1e-2)
+        self.model.train()
+        return self.model
+
+
+    def get_evaluator(self, batch_size, is_distributed, testdev=False, legacy=False):
+        from yolox.evaluators import CocoPoseEvaluator
+
+        return CocoPoseEvaluator(
+            dataloader=self.get_eval_loader(batch_size, is_distributed,
+                                            testdev=testdev, legacy=legacy),
+            img_size=self.test_size,
+            confthre=self.test_conf,
+            nmsthre=self.nmsthre,
+            num_classes=self.num_classes,
+            testdev=testdev,
+            num_keypoints=17
+        )
+
+
 _NAMED_CONFIG: dict[str, YoloxConfig] = {
     config.name: config
-    for config in (YoloxS(), YoloxM(), YoloxL(), YoloxX(), YoloxTiny(), YoloxNano())
+    for config in (YoloxS(), YoloxM(), YoloxL(), YoloxX(), YoloxTiny(), YoloxNano(), YoloxPose())
 }
